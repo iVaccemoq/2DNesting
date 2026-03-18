@@ -22,11 +22,11 @@ print("Total parts:", len(all_parts))
 
 
 placer = BottomLeftPlacer(
-    sheet_width=700,
-    sheet_height=700,
+    sheet_width=1000,
+    sheet_height=1000,
     allowed_angles=[0, 90]
 )
 
 layout = placer.place(all_parts)
 
-plot_layout(700, 700, layout, title="Multi-SVG nesting")
+plot_layout(1000, 1000, layout, title="Multi-SVG nesting")

@@ -10,11 +10,19 @@ random.seed(0)
 
 from geometry.polygon import rotate, translate, normalize, width_height
 from geometry.nfp import compute_nfp
-from shapely.geometry import Polygon as ShapelyPolygon
+from shapely.geometry import Polygon as ShapelyPolygon, Point as ShapelyPoint
 
 
 Point = Tuple[float, float]
 Polygon = List[Point]
+
+
+_CONCAVE_RATIO = 1.2
+
+
+def _poly_hash(polygon: Polygon) -> int:
+
+    return hash(tuple(polygon))
 
 
 @dataclass
@@ -33,11 +41,16 @@ class PlacedPart:
     angle: float
     area: float
     shape: Optional[ShapelyPolygon] = None
+    shape_shrunk: Optional[ShapelyPolygon] = None    
+    shape_expanded: Optional[ShapelyPolygon] = None  
 
+    def rebuild_shape(self):
+        
+        pts = [(vx + self.x, vy + self.y) for vx, vy in self.polygon]
+        self.shape = ShapelyPolygon(pts)
+        self.shape_shrunk = self.shape.buffer(-1e-6)
+        self.shape_expanded = self.shape.buffer(1e-6)
 
-# =========================
-# Geometry helper
-# =========================
 
 def point_in_polygon(point: Point, polygon: Polygon) -> bool:
     x, y = point
@@ -55,11 +68,6 @@ def point_in_polygon(point: Point, polygon: Polygon) -> bool:
 
     return inside
 
-
-# =========================
-# Main class
-# =========================
-
 class BottomLeftPlacer:
 
     def __init__(
@@ -68,62 +76,54 @@ class BottomLeftPlacer:
         sheet_height: float,
         allowed_angles: List[float],
         multi_start: int = 10,
+        direction: int = 0,
     ):
+        """
+        direction:
+            1 — горизонтальный раскрой: детали укладываются вдоль ширины листа,
+                свободный остаток образуется снизу (полоса по всей ширине).
+            0 — вертикальный раскрой: детали укладываются вдоль высоты листа,
+                свободный остаток образуется справа (полоса по всей высоте).
+        """
         self.sheet_width = sheet_width
         self.sheet_height = sheet_height
         self.allowed_angles = allowed_angles
         self.multi_start = multi_start
+        self.direction = direction
 
         self._nfp_cache = {}
 
-    # =========================
-    # Layout utilities
-    # =========================
-    
-    def _compact(self, placed: PlacedPart, placed_parts):
 
-        step = 0.5
-        max_iter = 120
+    def _compact(self, placed: PlacedPart, placed_parts: List[PlacedPart]) -> PlacedPart:
+        step = 1.0      
+        max_iter = 60   
+
         iter_count = 0
-
         while iter_count < max_iter:
-
             moved = False
 
-            # push down
             if self._can_place(
                 placed.polygon,
                 placed.x,
                 placed.y - step,
                 placed_parts,
                 placed.part_id,
-                placed.angle
+                placed.angle,
             ):
-                placed.y -= step
-                placed.y = round(placed.y, 4)
-
-                placed.shape = ShapelyPolygon(
-                    [(vx + placed.x, vy + placed.y) for vx, vy in placed.polygon]
-                )
-                
+                placed.y = round(placed.y - step, 4)
+                placed.rebuild_shape()
                 moved = True
 
-            # push left
             if self._can_place(
                 placed.polygon,
                 placed.x - step,
                 placed.y,
                 placed_parts,
                 placed.part_id,
-                placed.angle
+                placed.angle,
             ):
-                placed.y -= step
-                placed.y = round(placed.y, 4)
-
-                placed.shape = ShapelyPolygon(
-                    [(vx + placed.x, vy + placed.y) for vx, vy in placed.polygon]
-                )
-
+                placed.x = round(placed.x - step, 4)
+                placed.rebuild_shape()
                 moved = True
 
             if not moved:
@@ -132,7 +132,8 @@ class BottomLeftPlacer:
             iter_count += 1
 
         return placed
-    def _current_bounds(self, placed_parts: List[PlacedPart]):
+
+    def _current_bounds(self, placed_parts: List[PlacedPart]) -> Tuple[float, float]:
         if not placed_parts:
             return 0.0, 0.0
 
@@ -140,33 +141,29 @@ class BottomLeftPlacer:
         max_y = 0.0
 
         for p in placed_parts:
-            for vx, vy in p.polygon:
-                px = vx + p.x
-                py = vy + p.y
-
-                if px > max_x:
-                    max_x = px
-                if py > max_y:
-                    max_y = py
+            if p.shape is not None:
+                _, _, bx, by = p.shape.bounds
+            else:
+                bx = max(vx + p.x for vx, vy in p.polygon)
+                by = max(vy + p.y for vx, vy in p.polygon)
+            if bx > max_x:
+                max_x = bx
+            if by > max_y:
+                max_y = by
 
         return max_x, max_y
-    
-    def _contact_score(self, candidate: PlacedPart, placed_parts: List[PlacedPart]):
 
-        moving = ShapelyPolygon(
-            [(vx + candidate.x, vy + candidate.y) for vx, vy in candidate.polygon]
-        )
+    def _contact_score(self, candidate: PlacedPart, placed_parts: List[PlacedPart]) -> float:
+        if candidate.shape_expanded is None:
+            candidate.rebuild_shape()
 
+        moving_buf = candidate.shape_expanded
         contact = 0.0
 
         for placed in placed_parts:
-
-            static = ShapelyPolygon(
-                [(vx + placed.x, vy + placed.y) for vx, vy in placed.polygon]
-            )
-
-            inter = moving.buffer(1e-6).intersection(static.buffer(1e-6))
-
+            if placed.shape_expanded is None:
+                placed.rebuild_shape()
+            inter = moving_buf.intersection(placed.shape_expanded)
             contact += inter.length
 
         return contact
@@ -174,40 +171,31 @@ class BottomLeftPlacer:
     def _inside_layout(self, x, y, w, h, placed_parts):
         if not placed_parts:
             return False
-
         max_x, max_y = self._current_bounds(placed_parts)
-
         return (x + w <= max_x) and (y + h <= max_y)
 
     def _layout_score(self, placed_parts: List[PlacedPart]) -> float:
         max_x, max_y = self._current_bounds(placed_parts)
-        edge_penalty = abs(self.sheet_width - max_x)
         occupied_area = max_x * max_y
 
         parts_area = sum(p.area for p in placed_parts)
-
         gap_penalty = occupied_area - parts_area
-        if max_y == 0:
-            aspect_penalty = 0
+
+        if self.direction == 1:
+            # Горизонтальный раскрой:
+            #   - тянем max_x к ширине листа (штраф за недозаполнение по X)
+            #   - минимизируем max_y (свободная полоса — снизу, по всей ширине)
+            edge_penalty = abs(self.sheet_width - max_x)
+            clean_rect_area = self.sheet_width * max(0.0, self.sheet_height - max_y)
         else:
-            aspect_ratio = max_x / max_y
-            aspect_penalty = abs(aspect_ratio - 1.0)
-
-        remaining_width = self.sheet_width - max_x
-        remaining_height = self.sheet_height - max_y
-
-        clean_rect_area = max(
-            remaining_width * self.sheet_height,
-            self.sheet_width * remaining_height
-        )
-
-        w1 = 1.0
-        w2 = 800.0
-        w3 = 3.0
+            # Вертикальный раскрой:
+            #   - тянем max_y к высоте листа (штраф за недозаполнение по Y)
+            #   - минимизируем max_x (свободная полоса — справа, по всей высоте)
+            edge_penalty = abs(self.sheet_height - max_y)
+            clean_rect_area = max(0.0, self.sheet_width - max_x) * self.sheet_height
 
         score = (
             occupied_area
-            + 2000 * aspect_penalty
             + 5 * gap_penalty
             - 3 * clean_rect_area
             + 2 * edge_penalty
@@ -215,9 +203,50 @@ class BottomLeftPlacer:
 
         return score
 
-    # =========================
-    # MAIN
-    # =========================
+
+    def _get_interior_candidates(
+        self,
+        placed_parts: List[PlacedPart],
+        moving_w: float,
+        moving_h: float,
+    ) -> List[Tuple[float, float]]:
+
+        candidates = []
+
+        for placed in placed_parts:
+            if placed.shape is None:
+                placed.rebuild_shape()
+
+            shape = placed.shape
+            if not shape.is_valid or shape.area < 1e-6:
+                continue
+
+            hull = shape.convex_hull
+            if hull.area <= 0:
+                continue
+
+            ratio = hull.area / max(shape.area, 1e-9)
+            if ratio < _CONCAVE_RATIO:
+                continue
+
+            pocket = hull.difference(shape)
+            if pocket.is_empty or pocket.area < moving_w * moving_h * 0.25:
+                continue
+
+            minx, miny, maxx, maxy = pocket.bounds
+            step = max(moving_w * 0.5, moving_h * 0.5, 1.0)
+
+            x = minx
+            while x <= maxx:
+                y = miny
+                while y <= maxy:
+                    if pocket.contains(ShapelyPoint(x, y)):
+                        candidates.append((x - moving_w / 2, y - moving_h / 2))
+                        candidates.append((x, y))
+                    y += step
+                x += step
+
+        return candidates
 
     def place(self, parts: List[Part]) -> List[PlacedPart]:
         best_layout = None
@@ -248,18 +277,18 @@ class BottomLeftPlacer:
 
             if score < best_score:
                 best_score = score
-                best_layout = copy.deepcopy(placed_parts)
+
+                best_layout = [
+                    PlacedPart(p.part_id, p.polygon, p.x, p.y, p.angle, p.area)
+                    for p in placed_parts
+                ]
+                for p in best_layout:
+                    p.rebuild_shape()
 
         if best_layout is None:
             raise RuntimeError("Failed to place parts")
 
-        
-
         return best_layout
-
-    # =========================
-    # LOCAL IMPROVEMENT
-    # =========================
 
     def _local_improvement(self, layout: List[PlacedPart]) -> List[PlacedPart]:
         best_layout = layout
@@ -273,7 +302,7 @@ class BottomLeftPlacer:
                 part = Part(
                     id=part_to_move.part_id,
                     polygon=part_to_move.polygon,
-                    area=part_to_move.area
+                    area=part_to_move.area,
                 )
                 new_position = self._place_single_part(part, remaining)
 
@@ -288,14 +317,6 @@ class BottomLeftPlacer:
                     break
 
         return best_layout
-
-    # =========================
-    # SINGLE PART PLACEMENT
-    # =========================
-
-        # =========================
-    # MULTI RELOCATION
-    # =========================
 
     def _multi_relocation(self, layout: List[PlacedPart], iterations: int = 20) -> List[PlacedPart]:
         best_layout = layout
@@ -315,7 +336,7 @@ class BottomLeftPlacer:
                 part = Part(
                     id=part_to_insert.part_id,
                     polygon=part_to_insert.polygon,
-                    area=part_to_insert.area
+                    area=part_to_insert.area,
                 )
                 new_position = self._place_single_part(part, new_layout)
                 if not new_position:
@@ -339,10 +360,6 @@ class BottomLeftPlacer:
         best_candidate = None
         best_score = float("inf")
 
-        # для bottom-left
-        best_y = float("inf")
-        best_x = float("inf")
-
         for angle in self.allowed_angles:
 
             rotated = rotate(part.polygon, angle)
@@ -363,13 +380,13 @@ class BottomLeftPlacer:
                     best_candidate = temp_layout[0]
 
                 continue
-            
 
-            candidates = set()
+            candidates: set = set()
             candidates.add((0.0, 0.0))
+
             for placed in placed_parts:
 
-                cache_key = (placed.angle, angle, len(placed.polygon), len(rotated))
+                cache_key = (_poly_hash(placed.polygon), _poly_hash(rotated), placed.angle, angle)
 
                 if cache_key in self._nfp_cache:
                     nfp = self._nfp_cache[cache_key]
@@ -381,21 +398,21 @@ class BottomLeftPlacer:
 
                 for x, y in nfp_global:
                     candidates.add((x, y))
-            
-            # вершины уже размещенных деталей
+
             for placed in placed_parts:
                 for vx, vy in placed.polygon:
                     candidates.add((vx + placed.x, vy + placed.y))
 
-            # кандидаты вдоль границы текущего layout
+
             max_x, max_y = self._current_bounds(placed_parts)
 
             candidates.add((max_x, 0))
             candidates.add((0, max_y))
             candidates.add((max_x, max_y))
+            candidates.add((max_x / 2, max_y / 2))
 
-            # центр layout (помогает заполнять карманы)
-            candidates.add((max_x/2, max_y/2))
+            for c in self._get_interior_candidates(placed_parts, w, h):
+                candidates.add(c)
 
             ordered_candidates = sorted(candidates, key=lambda p: (p[1], p[0]))
 
@@ -404,38 +421,24 @@ class BottomLeftPlacer:
                 if not self._can_place(rotated, x, y, placed_parts, part.id, angle):
                     continue
 
-                shape = ShapelyPolygon([(vx + x, vy + y) for vx, vy in rotated])
-                candidate = PlacedPart(part.id, rotated, x, y, angle, part.area, shape)
+                candidate = PlacedPart(part.id, rotated, x, y, angle, part.area)
+                candidate.rebuild_shape()
 
                 candidate = self._compact(candidate, placed_parts)
 
-                # обновляем shape после compact
-                candidate.shape = ShapelyPolygon(
-                    [(vx + candidate.x, vy + candidate.y) for vx, vy in candidate.polygon]
-                )
-
-                # проверяем снова после сдвига
                 if not self._can_place(candidate.polygon, candidate.x, candidate.y, placed_parts, part.id, angle):
                     continue
 
                 temp_layout = placed_parts + [candidate]
-
                 score = self._layout_score(temp_layout)
-
                 contact = self._contact_score(candidate, placed_parts)
-
                 combined = score - contact * 500
 
                 if combined < best_score:
-
                     best_score = combined
                     best_candidate = candidate
 
         return best_candidate
-
-    # =========================
-    # COLLISION CHECK
-    # =========================
 
     def _can_place(
         self,
@@ -447,30 +450,29 @@ class BottomLeftPlacer:
         angle: float,
     ) -> bool:
 
-        moving = ShapelyPolygon([(vx + x, vy + y) for vx, vy in polygon]).buffer(0)
-        moving_shrink = moving.buffer(-1e-6)
 
-        # проверка границ листа
-        minx, miny, maxx, maxy = moving.bounds
+        min_x = x + min(vx for vx, vy in polygon)
+        min_y = y + min(vy for vx, vy in polygon)
+        max_x = x + max(vx for vx, vy in polygon)
+        max_y = y + max(vy for vx, vy in polygon)
 
-        if minx < 0 or miny < 0:
+        if min_x < 0 or min_y < 0:
             return False
 
-        if maxx > self.sheet_width or maxy > self.sheet_height:
+        if max_x > self.sheet_width or max_y > self.sheet_height:
             return False
+
+        if not placed_parts:
+            return True
+
+        moving_shrink = ShapelyPolygon([(vx + x, vy + y) for vx, vy in polygon]).buffer(-1e-6)
 
         for placed in placed_parts:
 
-            static = placed.shape
+            if placed.shape_shrunk is None:
+                placed.rebuild_shape()
 
-            # если shape ещё не создан (первая деталь)
-            if static is None:
-                static = ShapelyPolygon(
-                    [(vx + placed.x, vy + placed.y) for vx, vy in placed.polygon]
-                )
-                placed.shape = static
-
-            if moving_shrink.intersects(static.buffer(-1e-6)):
+            if moving_shrink.intersects(placed.shape_shrunk):
                 return False
 
         return True
